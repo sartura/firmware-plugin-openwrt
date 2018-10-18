@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <stdio.h>
 #include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -26,7 +27,8 @@
 
 const char file_path[FILENAME_MAX] = "/tmp/sr_firmware.bin";
 
-void delete_firmware(const char *filename) {
+void delete_firmware(const char *filename)
+{
     int ret;
 
     ret = remove(filename);
@@ -138,6 +140,8 @@ error:
 /* copy startup datatsore file to /etc/sysrepo/sysupgrade */
 static void generate_startup_data(firmware_t *firmware)
 {
+    INF_MSG("Generating startup data");
+
     char *filename = "/etc/sysrepo/sysupgrade/ietf-system.startup";
     FILE *file = NULL;
 
@@ -147,7 +151,7 @@ static void generate_startup_data(firmware_t *firmware)
     }
 
     fprintf(file, "<system xmlns=\"urn:ietf:params:xml:ns:yang:ietf-system\">\n");
-    fprintf(file, "  <software xmlns=\"http://terastrm.net/ns/yang/" YANG "\">\n");
+    fprintf(file, "  <software xmlns=\"http://router.net/ns/yang/" YANG "\">\n");
     fprintf(file, "    <software>\n");
     if (NULL != firmware->source.uri) {
         fprintf(file, "      <source>%s</source>\n", firmware->source.uri);
@@ -494,6 +498,20 @@ cleanup:
     return rc;
 }
 
+static int exec_prog(const char **argv)
+{
+    pid_t my_pid;
+
+    if (0 == (my_pid = fork())) {
+        if (-1 == execve(argv[0], (char **) argv, NULL)) {
+            ERR("child process execve failed [%s]", strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 int sysupgrade(ctx_t *ctx)
 {
     int rc = SR_ERR_OK;
@@ -516,7 +534,7 @@ int sysupgrade(ctx_t *ctx)
     /* image check failed */
     if (0 != WEXITSTATUS(status)) {
         if (0 < strlen(result)) {
-            ERR("upgrade faild with message:%s", result);
+            ERR("upgrade failed with message:%s", result);
             SET_MEM_STR(ctx->installing_software.message, result);
             SET_MEM_STR(ctx->installing_software.status, "upgrade-failed");
         }
@@ -524,31 +542,15 @@ int sysupgrade(ctx_t *ctx)
     }
 
     SET_MEM_STR(ctx->installing_software.status, "upgrade-in-progress");
-    SET_MEM_STR(ctx->installing_software.message, "starting sysupgrade with ubus call");
-    struct blob_buf buf = {0};
-    struct json_object *p;
-    uint32_t id = 0;
-    int u_rc = 0;
+    SET_MEM_STR(ctx->installing_software.message, "starting sysupgrade");
 
-    struct ubus_context *u_ctx = ubus_connect(NULL);
-    if (u_ctx == NULL) {
-        ERR_MSG("Could not connect to ubus");
-        goto cleanup;
-    }
-
-    blob_buf_init(&buf, 0);
-    u_rc = ubus_lookup_id(u_ctx, "juci.sysupgrade", &id);
-    if (UBUS_STATUS_OK != u_rc) {
-        SET_MEM_STR(ctx->installing_software.message, "no object juci.sysupgrade");
-        ERR("ubus [%d]: no object juci.sysupgrade", u_rc);
-        goto cleanup;
-    }
-
-    p = json_object_new_object();
-    json_object_object_add(p, "path", json_object_new_string(file_path));
-
+    const char *args[4];
     if (ctx->firmware.preserve_configuration) {
-        json_object_object_add(p, "keep", json_object_new_string("1"));
+        args[0] = "/sbin/sysupgrade";
+        args[1] = file_path;
+        args[2] = NULL;
+        args[3] = NULL;
+
         /* if /etc/sysrepo/sysupgrade does not exist, create it */
         const char *dir = "/etc/sysrepo/sysupgrade";
         struct stat st = {0};
@@ -559,26 +561,21 @@ int sysupgrade(ctx_t *ctx)
         generate_startup_data(&ctx->firmware);
         update_checksum(&ctx->firmware);
     } else {
-        json_object_object_add(p, "keep", json_object_new_string("0"));
+        args[0] = "/sbin/sysupgrade";
+        args[1] = "-n";
+        args[2] = file_path;
+        args[3] = NULL;
     }
-    const char *json_data = json_object_get_string(p);
-    blobmsg_add_json_from_string(&buf, json_data);
-    json_object_put(p);
 
-    u_rc = ubus_invoke(u_ctx, id, "start", buf.head, NULL, NULL, 0);
-    if (UBUS_STATUS_OK != u_rc) {
-        SET_MEM_STR(ctx->installing_software.message, "no object start");
-        ERR("ubus [%d]: no object start", u_rc);
+    rc = exec_prog(args);
+    if (0 != rc) {
+        SET_MEM_STR(ctx->installing_software.message, "failed exec of sysupgrade");
         goto cleanup;
     }
 
     SET_MEM_STR(ctx->installing_software.status, "upgrade-done");
 
 cleanup:
-    if (NULL != u_ctx) {
-        ubus_free(u_ctx);
-        blob_buf_free(&buf);
-    }
 
     return rc;
 }

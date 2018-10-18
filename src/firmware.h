@@ -22,7 +22,7 @@
 #ifndef FIRMWARE_H
 #define FIRMWARE_H
 
-#define YANG "terastream-software"
+#define YANG "router-software"
 
 #include <sysrepo.h>
 #include "sysrepo/xpath.h"

@@ -488,13 +488,6 @@ static int state_data_cb(const char *orig_xpath, sr_val_t **values, size_t *valu
         }
     }
 
-    //if (*values_cnt > 0) {
-    //    INF("Debug sysrepo values printout: %zu", *values_cnt);
-    //    for (size_t i = 0; i < *values_cnt; i++) {
-    //        sr_print_val(&(*values)[i]);
-    //    }
-    //}
-
 error:
     if (NULL != xpath) {
         free(xpath);
@@ -505,93 +498,10 @@ error:
     return rc;
 }
 
-static void serial_number_ubus_cb(struct ubus_request *req, int type, struct blob_attr *msg)
-{
-    ubus_ctx_t *ubus_ctx = req->priv;
-    struct json_object *jobj_parent = NULL, *jobj_system = NULL, *jobj_serial = NULL;
-    char *json_string = NULL;
-    const char *result_string = NULL;
-    int rc = SR_ERR_OK;
-
-    if (msg) {
-        json_string = blobmsg_format_json(msg, true);
-        jobj_parent = json_tokener_parse(json_string);
-    } else {
-        goto cleanup;
-    }
-
-    json_object_object_get_ex(jobj_parent, "system", &jobj_system);
-    if (NULL == jobj_system) {
-        goto cleanup;
-    }
-    json_object_object_get_ex(jobj_system, "serialno", &jobj_serial);
-    if (NULL == jobj_serial) {
-        goto cleanup;
-    }
-
-    result_string = json_object_get_string(jobj_serial);
-
-    *ubus_ctx->values_cnt = 1;
-    rc = sr_new_val("/ietf-system:system-state/ietf-system:platform/" YANG ":serial-number", ubus_ctx->values);
-    CHECK_RET(rc, cleanup, "failed sr_new_values: %s", sr_strerror(rc));
-    sr_val_set_str_data(*ubus_ctx->values, SR_STRING_T, result_string);
-
-cleanup:
-    if (NULL != jobj_parent) {
-        json_object_put(jobj_parent);
-    }
-    if (NULL != json_string) {
-        free(json_string);
-    }
-    return;
-}
-
-static int serial_number_cb(const char *xpath, sr_val_t **values, size_t *values_cnt, uint64_t request_id, void *private_ctx)
-{
-    int rc = SR_ERR_OK;
-    ctx_t *ctx = private_ctx;
-    uint32_t id = 0;
-    struct blob_buf buf = {0};
-    ubus_ctx_t ubus_ctx = {0, 0, 0};
-    int u_rc = UBUS_STATUS_OK;
-
-    struct ubus_context *u_ctx = ubus_connect(NULL);
-    if (u_ctx == NULL) {
-        ERR_MSG("Could not connect to ubus");
-        rc = SR_ERR_INTERNAL;
-        goto cleanup;
-    }
-
-    blob_buf_init(&buf, 0);
-    u_rc = ubus_lookup_id(u_ctx, "router.system", &id);
-    if (UBUS_STATUS_OK != u_rc) {
-        ERR("ubus [%d]: no object router.system\n", u_rc);
-        rc = SR_ERR_INTERNAL;
-        goto cleanup;
-    }
-
-    ubus_ctx.ctx = ctx;
-    ubus_ctx.values = values;
-    ubus_ctx.values_cnt = values_cnt;
-    u_rc = ubus_invoke(u_ctx, id, "info", buf.head, serial_number_ubus_cb, &ubus_ctx, 0);
-    if (UBUS_STATUS_OK != u_rc) {
-        ERR("ubus [%d]: no object info\n", u_rc);
-        rc = SR_ERR_INTERNAL;
-        goto cleanup;
-    }
-
-cleanup:
-    if (NULL != u_ctx) {
-        ubus_free(u_ctx);
-        blob_buf_free(&buf);
-    }
-    return rc;
-}
-
 static void software_version_ubus_cb(struct ubus_request *req, int type, struct blob_attr *msg)
 {
     ubus_ctx_t *ubus_ctx = req->priv;
-    struct json_object *jobj_parent = NULL, *jobj_system = NULL, *jobj_firmware = NULL;
+    struct json_object *jobj_parent = NULL, *jobj_release = NULL, *jobj_description = NULL;
     char *json_string = NULL;
     const char *result_string = NULL;
     int rc = SR_ERR_OK;
@@ -603,16 +513,16 @@ static void software_version_ubus_cb(struct ubus_request *req, int type, struct 
         goto cleanup;
     }
 
-    json_object_object_get_ex(jobj_parent, "system", &jobj_system);
-    if (NULL == jobj_system) {
+    json_object_object_get_ex(jobj_parent, "release", &jobj_release);
+    if (NULL == jobj_release) {
         goto cleanup;
     }
-    json_object_object_get_ex(jobj_system, "firmware", &jobj_firmware);
-    if (NULL == jobj_firmware) {
+    json_object_object_get_ex(jobj_release, "description", &jobj_description);
+    if (NULL == jobj_description) {
         goto cleanup;
     }
 
-    result_string = json_object_get_string(jobj_firmware);
+    result_string = json_object_get_string(jobj_description);
 
     *ubus_ctx->values_cnt = 1;
     rc = sr_new_val("/ietf-system:system-state/ietf-system:platform/" YANG ":software-version", ubus_ctx->values);
@@ -646,9 +556,9 @@ static int software_version_cb(const char *xpath, sr_val_t **values, size_t *val
     }
 
     blob_buf_init(&buf, 0);
-    u_rc = ubus_lookup_id(u_ctx, "router.system", &id);
+    u_rc = ubus_lookup_id(u_ctx, "system", &id);
     if (UBUS_STATUS_OK != u_rc) {
-        ERR("ubus [%d]: no object router.system\n", u_rc);
+        ERR("ubus [%d]: no object system\n", u_rc);
         rc = SR_ERR_INTERNAL;
         goto cleanup;
     }
@@ -656,7 +566,7 @@ static int software_version_cb(const char *xpath, sr_val_t **values, size_t *val
     ubus_ctx.ctx = ctx;
     ubus_ctx.values = values;
     ubus_ctx.values_cnt = values_cnt;
-    u_rc = ubus_invoke(u_ctx, id, "info", buf.head, software_version_ubus_cb, &ubus_ctx, 0);
+    u_rc = ubus_invoke(u_ctx, id, "board", buf.head, software_version_ubus_cb, &ubus_ctx, 0);
     if (UBUS_STATUS_OK != u_rc) {
         ERR("ubus [%d]: no object info\n", u_rc);
         rc = SR_ERR_INTERNAL;
@@ -675,54 +585,9 @@ cleanup:
 static int
 rpc_firstboot_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt, sr_val_t **output, size_t *output_cnt, void *private_ctx)
 {
-    (void) signal(SIGUSR1, sig_handler);
-    size_t rpcd_pid = fork();
+    INF_MSG("rpc callback rpc_firstboot_cb currently not supported");
 
-    INF("rpcd_pid %d", rpcd_pid);
-    if (-1 == sysupgrade_pid) {
-        ERR_MSG("failed to fork()");
-        return SR_ERR_INTERNAL;
-    } else if (0 == rpcd_pid) {
-        /* wait for sysrepo/netopeer2 to finish the RPC call */
-        sleep(3);
-
-        INF_MSG("rpc callback rpc_firstboot_cb has been called");
-        struct blob_buf buf = {0};
-        uint32_t id = 0;
-        int u_rc = 0;
-
-        struct ubus_context *u_ctx = ubus_connect(NULL);
-        if (u_ctx == NULL) {
-            ERR_MSG("Could not connect to ubus");
-            goto cleanup;
-        }
-
-        blob_buf_init(&buf, 0);
-        u_rc = ubus_lookup_id(u_ctx, "juci.system", &id);
-        if (UBUS_STATUS_OK != u_rc) {
-            ERR("ubus [%d]: no object juci.system", u_rc);
-            goto cleanup;
-        }
-
-        u_rc = ubus_invoke(u_ctx, id, "defaultreset", buf.head, NULL, NULL, 0);
-        if (UBUS_STATUS_OK != u_rc) {
-            ERR("ubus [%d]: no object defaultreset", u_rc);
-            goto cleanup;
-        }
-
-    cleanup:
-        if (NULL != u_ctx) {
-            ubus_free(u_ctx);
-            blob_buf_free(&buf);
-        }
-
-        if (UBUS_STATUS_OK != u_rc) {
-            return SR_ERR_INTERNAL;
-        }
-        exit(EXIT_SUCCESS);
-    }
-
-    return SR_ERR_OK;
+    return SR_ERR_UNSUPPORTED;
 }
 
 static int rpc_reboot_cb(const char *xpath, const sr_val_t *input, const size_t input_cnt, sr_val_t **output, size_t *output_cnt, void *private_ctx)
@@ -750,9 +615,9 @@ static int rpc_reboot_cb(const char *xpath, const sr_val_t *input, const size_t 
         }
 
         blob_buf_init(&buf, 0);
-        u_rc = ubus_lookup_id(u_ctx, "juci.system", &id);
+        u_rc = ubus_lookup_id(u_ctx, "system", &id);
         if (UBUS_STATUS_OK != u_rc) {
-            ERR("ubus [%d]: no object juci.system", u_rc);
+            ERR("ubus [%d]: no object system", u_rc);
             goto cleanup;
         }
 
@@ -809,10 +674,6 @@ int sr_plugin_init_cb(sr_session_ctx_t *session, void **private_ctx)
                                    ctx,
                                    SR_SUBSCR_CTX_REUSE,
                                    &ctx->sub);
-    CHECK_RET(rc, error, "failed sr_dp_get_items_subscribe: %s", sr_strerror(rc));
-
-    rc = sr_dp_get_items_subscribe(
-        ctx->sess, "/ietf-system:system-state/ietf-system:platform/" YANG ":serial-number", serial_number_cb, ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);
     CHECK_RET(rc, error, "failed sr_dp_get_items_subscribe: %s", sr_strerror(rc));
 
     rc = sr_dp_get_items_subscribe(ctx->sess, "/ietf-system:system-state/" YANG ":software", state_data_cb, ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);

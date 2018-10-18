@@ -1,7 +1,7 @@
-module terastream-software {
-  namespace "http://terastrm.net/ns/yang/terastream-software";
+module router-software {
+  namespace "http://router.net/ns/yang/router-software";
 
-  prefix "ts-sw";
+  prefix "ro-sw";
 
   // import statements here: e.g.,
 
@@ -15,82 +15,10 @@ module terastream-software {
     revision-date 2013-07-15;
   }
 
-  organization
-    "Deutsche Telekom AG";
-
-  contact
-    "Landgrabenweg 151
-    53227 Bonn, Germany
-    Editor: Ian Farrer <ian.farrer@telekom.de>";
-
   description
-    "This module defines RPCs for the TeraStream home gateway project.";
+    "This module defines RPCs for the generic OpenWrt router";
 
-  revision "2017-11-01" {
-    description
-      "Version 0.1.4
-      Simplify to use single slot devices, removed slots from the YANG model.
-      Add sha-256 to checksum type.
-      Change features by authentication type.
-      Add leaf preserve-configuration.
-      Add max-elements to list software.
-      Changed namespace.
-      Add leaf name for key value.
-      Removed leaf path from software.
-      Add leaf serial-number to /sys:system-state/sys:platform.
-      Add RPC system-reset-restart.";
-  }
-
-  revision "2017-07-11" {
-    description
-      "Version 0.2.0
-      Replace RPC with config.";
-  }
-
-  revision "2014-02-06" {
-    description
-      "Version 0.1.5
-      Remove RPC get-job-status.
-      Remove transport choice, use URI with username instead.";
-  }
-
-  revision "2014-01-27" {
-    description
-      "Version 0.1.5
-      Move boot status to system module.";
-  }
-
-  revision "2014-01-20" {
-    description
-      "Version 0.1.4
-      Move download status to download-job.
-      Add RPC to fetch job status.
-      Add key to software-slots.
-      Use leafrefs to refer software-slots.
-      Remove system-reset RPC because that is covered by Netconf's delete-config(startup)+system-restart().
-      Re-include download RPCs.";
-  }
-
-  revision "2014-01-12" {
-    description
-      "Version 0.1.3
-      Move RPC software-download to transport-specific modules.";
-  }
-
-  revision "2014-01-09" {
-    description
-      "Version 0.1.2
-      Rename feature multiple-partitions to software-slots.";
-  }
-
-  revision "2013-12-19" {
-    description
-      "Version 0.1.1
-      Rename module to opencpe-software-mgmt.
-      Add target location to download RPC.";
-  }
-
-  revision "2013-12-12" {
+  revision "2018-10-22" {
     description
       "Version 0.1.0 -- Initial version.";
   }
@@ -311,7 +239,7 @@ module terastream-software {
 
     leaf running-software {
       type leafref {
-        path "../ts-sw:software/source";
+        path "../ro-sw:software/source";
       }
       description
        "Currently running software on the HGW.";
@@ -386,11 +314,6 @@ module terastream-software {
       type string;
       description
         "Version of the currently running software";
-    }
-    leaf serial-number {
-      type string;
-      description
-        "Device serial number";
     }
   }
 
