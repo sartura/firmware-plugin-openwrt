@@ -1,62 +1,91 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 2.6)
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/CMakeModules/")
-set(PLUGIN 0 CACHE BOOL "Build a plugin.")
+cmake_minimum_required(VERSION 2.8)
+project(sysrepo-plugin-router-firmware C)
 
-PROJECT(sysrepo-plugin-router-firmware)
+include(CompileOptions.cmake)
 
+set(PLUGIN 0 CACHE BOOL "Build a plugin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -Wall")
+include_directories(${CMAKE_SOURCE_DIR}/src/)
 
 set(SOURCES
-	src/parse.c
-	src/firmware.c)
+    src/firmware.c
+    src/upgrade.c
+    src/utils/memory.c
+)
 
 # git SHA1 hash
-execute_process(COMMAND
-  git describe --always --abbrev=40
-  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  OUTPUT_VARIABLE GIT_SHA1
-  ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND
+    git describe --always --abbrev=40
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE
+    GIT_SHA1
+    ERROR_QUIET
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+
+# get sysrepo version
+find_package(PkgConfig)
+if (PKG_CONFIG_FOUND)
+    execute_process(COMMAND ${PKG_CONFIG_EXECUTABLE} "--modversion" "libsysrepo" OUTPUT_VARIABLE SYSREPO_VERSION)
+    if(SYSREPO_VERSION)
+        # strip new line from string
+        string(STRIP ${SYSREPO_VERSION} SYSREPO_VERSION)
+        if(${SYSREPO_VERSION} VERSION_LESS "1.0.0")
+            message(FATAL_ERROR "${PROJECT_NAME} requires at least libsysrepo verision 1.0.0")
+        endif()
+    endif()
+endif()
 
 # generate version.h
 configure_file("${PROJECT_SOURCE_DIR}/src/version.h.in" "${PROJECT_SOURCE_DIR}/src/version.h" ESCAPE_QUOTES @ONLY)
 
 if(PLUGIN)
-	add_library(${CMAKE_PROJECT_NAME} MODULE ${SOURCES})
-	install(TARGETS ${CMAKE_PROJECT_NAME} DESTINATION lib)
+    add_library(${CMAKE_PROJECT_NAME} MODULE ${SOURCES})
+    install(TARGETS ${CMAKE_PROJECT_NAME} DESTINATION lib)
 else()
-	add_executable(${CMAKE_PROJECT_NAME} ${SOURCES})
-	install(TARGETS ${CMAKE_PROJECT_NAME} DESTINATION bin)
+    add_executable(${CMAKE_PROJECT_NAME} ${SOURCES})
+    install(TARGETS ${CMAKE_PROJECT_NAME} DESTINATION bin)
 endif()
 
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${CMAKE_PROJECT_NAME} PREFIX "")
 
-# dependencies - libyang
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
+
 find_package(LibYANG REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBYANG_LIBRARIES})
-include_directories(${LIBYANG_INCLUDE_DIRS})
-
-# dependencies - sysrepo
 find_package(SYSREPO REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} ${SYSREPO_LIBRARIES})
-include_directories(${SYSREPO_INCLUDE_DIRS})
-
-# dependencies - libubox
-FIND_PACKAGE(LIBUBOX REQUIRED)
-INCLUDE_DIRECTORIES(${LIBUBOX_INCLUDE_DIR})
-TARGET_LINK_LIBRARIES(${CMAKE_PROJECT_NAME} ${LIBUBOX_LIBRARIES})
-
+find_package(UCI REQUIRED)
+find_package(LIBUBOX REQUIRED)
 find_package(LIBUBUS REQUIRED)
-include_directories(${LIBUBUS_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBUBUS_LIBRARIES})
-
+find_package(JSON-C REQUIRED)
 find_package(CURL REQUIRED)
-include_directories(${CURL_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} ${CURL_LIBRARIES})
-
 find_package(OpenSSL REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} ${OPENSSL_LIBRARIES})
-include_directories(${OPENSSL_INCLUDE_DIR})
+find_package(SRPO REQUIRED)
 
-TARGET_LINK_LIBRARIES(${CMAKE_PROJECT_NAME} json-c)
+
+target_link_libraries(
+    ${PROJECT_NAME}
+    ${LIBYANG_LIBRARIES}
+    ${SYSREPO_LIBRARIES}
+    ${UCI_LIBRARIES}
+    ${LIBUBOX_LIBRARIES}
+    ${LIBUBUS_LIBRARIES}
+    ${JSON-C_LIBRARIES}
+    ${CURL_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${SRPO_LIBRARIES}
+)
+
+include_directories(
+    ${LIBYANG_INCLUDE_DIRS}
+    ${SYSREPO_INCLUDE_DIRS}
+    ${UCI_INCLUDE_DIR}
+    ${LIBUBOX_INCLUDE_DIR}
+    ${LIBUBUS_INCLUDE_DIR}
+    ${JSON-C_INCLUDE_DIR}
+    ${CURL_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${SRPO_INCLUDE_DIRS}
+)

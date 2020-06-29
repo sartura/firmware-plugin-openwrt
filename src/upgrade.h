@@ -1,7 +1,7 @@
 /**
- * @file parse.h
+ * @file upgrade.h
  * @author Mislav Novakovic <mislav.novakovic@sartur.hr>
- * @brief header file for parse.c.
+ * @brief header file for upgrade.c
  *
  * @copyright
  * Copyright (C) 2017 Deutsche Telekom AG.
@@ -19,14 +19,13 @@
  * limitations under the License.
  */
 
-#ifndef PARSE_H
-#define PARSE_H
+#ifndef UPGRADE_H
+#define UPGRADE_H
 
 #include "firmware.h"
 
-bool compare_checksum(ctx_t *, firmware_t *);
-int load_startup_datastore(ctx_t *);
-int firmware_download(ctx_t *);
-int sysupgrade(ctx_t *);
+bool compare_firmware_checksum(plugin_ctx_t *, firmware_t *);
+int download_firmware(plugin_ctx_t *);
+int install_firmware(plugin_ctx_t *);
 
-#endif /* PARSE_H */
+#endif /* UPGRADE_H */

@@ -1,908 +1,854 @@
-#include <signal.h>
-#include <sys/mman.h>
+#include <inttypes.h>
+#include <unistd.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <unistd.h>
+#include <sys/mman.h>
 
 #include <json-c/json.h>
-#include <libubox/blobmsg.h>
-#include <libubox/blobmsg_json.h>
-#include <libubus.h>
 
 #include <sysrepo.h>
+#include <sysrepo/xpath.h>
 #include <sysrepo/values.h>
 
-#include "common.h"
+#include <srpo_uci.h>
+#include <srpo_ubus.h>
+
 #include "firmware.h"
-#include "parse.h"
-#include "version.h"
+#include "upgrade.h"
+#include "utils/memory.h"
 
-static int install_firmware(ctx_t *);
-static int update_firmware(ctx_t *, sr_val_t *);
+#define ARRAY_SIZE(X) (sizeof((X)) / sizeof((X)[0]))
 
-static const char *xpath_download_policy =
-    "/ietf-system:system/" YANG ":software/download-policy";
-static const char *xpath_system_software =
-    "/ietf-system:system/" YANG ":software/software";
+#define BASE_YANG_MODEL     "ietf-system"
+#define SOFTWARE_YANG_MODEL "terastream-software"
 
-bool can_restart(ctx_t *ctx) {
-  if (access("/var/sysupgrade.lock", F_OK) != -1) {
-    return false;
-  }
+#define RESTART_YANG_PATH  "/" BASE_YANG_MODEL ":system-restart"
+#define SOFTWARE_YANG_PATH "/" BASE_YANG_MODEL ":system/" SOFTWARE_YANG_MODEL ":software"
+#define RESET_YANG_PATH    "/" SOFTWARE_YANG_MODEL ":system-reset-restart"
 
-  if (0 == strcmp(ctx->installing_software.status, "upgrade-in-progress")) {
-    return false;
-  } else if (0 == strcmp(ctx->installing_software.status, "upgrade-done")) {
-    return false;
-  }
+#define SOFTWARE_YANG_STATE_PATH "/ietf-system:system-state/" SOFTWARE_YANG_MODEL ":software"
+#define RUNNING_YANG_STATE_PATH  "/ietf-system:system-state/" SOFTWARE_YANG_MODEL ":running-software"
+#define VERSION_YANG_STATE_PATH  "/ietf-system:system-state/platform/" SOFTWARE_YANG_MODEL ":software-version"
 
-  return true;
+static const char *SOFTWARE_XPATH = SOFTWARE_YANG_PATH "/software";
+static const char *DOWNLOAD_POLICY_XPATH = SOFTWARE_YANG_PATH "/download-policy";
+static const char *RUNNING_XPATH = RUNNING_YANG_STATE_PATH;
+
+static void sigusr1_handler(__attribute__((unused)) int signum);
+
+int firmware_plugin_init_cb(sr_session_ctx_t *session, void **private_data);
+void firmware_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data);
+
+static int firmware_module_change_cb(sr_session_ctx_t *session, const char *module_name,
+				     const char *xpath, sr_event_t event, uint32_t request_id, void *private_data);
+static int firmware_state_data_cb(sr_session_ctx_t *session, const char *module_name,
+				  const char *path, const char *request_xpath, uint32_t request_id,
+				  struct lyd_node **parent, void *private_data);
+static int firmware_state_software_cb(sr_session_ctx_t *session, const char *module_name,
+				      const char *path, const char *request_xpath, uint32_t request_id,
+				      struct lyd_node **parent, void *private_data);
+static int firmware_state_running_cb(sr_session_ctx_t *session, const char *module_name,
+				     const char *path, const char *request_xpath, uint32_t request_id,
+				     struct lyd_node **parent, void *private_data);
+static int firmware_rpc_cb(sr_session_ctx_t *session, const char *op_path,
+			   const sr_val_t *input, const size_t input_cnt,
+			   sr_event_t event, uint32_t request_id,
+			   sr_val_t **output, size_t *output_cnt, void *private_data);
+
+static void init_operational_data(oper_t *operational);
+static void clean_operational_data(oper_t *operational);
+static void clean_configuration_data(firmware_t *firmware);
+static void default_download_policy(struct download_policy *policy);
+
+static int update_firmware_context_value(plugin_ctx_t *ctx, const struct lyd_node *node);
+
+static int can_restart(plugin_ctx_t *ctx);
+static int run_firmware_install_steps(plugin_ctx_t *ctx);
+static int load_startup_datastore(plugin_ctx_t *session);
+
+static void firmware_ubus_version(const char *ubus_json, srpo_ubus_result_values_t *values);
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath,
+					  srpo_ubus_result_values_t *values, struct lyd_node **parent);
+
+
+int firmware_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
+{
+	int error = 0;
+	plugin_ctx_t *ctx = NULL;
+	sr_conn_ctx_t *connection = NULL;
+	sr_session_ctx_t *startup_session = NULL;
+	sr_subscription_ctx_t *subscription = NULL;
+
+	*private_data = NULL;
+
+	error = srpo_uci_init();
+	if (error) {
+		SRP_LOG_ERR("srpo_uci_init error (%d): %s", error, srpo_uci_error_description_get(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("start session to startup datastore");
+
+	connection = sr_session_get_connection(session);
+	error = sr_session_start(connection, SR_DS_STARTUP, &startup_session);
+	if (error) {
+		SRP_LOG_ERR("sr_session_start error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	/* create private plugin context */
+	ctx = xcalloc(1, sizeof(plugin_ctx_t));
+	*ctx = (plugin_ctx_t){
+		.model = SOFTWARE_YANG_MODEL, .startup_connection = connection,
+		.session = session, .startup_session = startup_session, .subscription = NULL,
+	};
+	*private_data = ctx;
+
+	clean_configuration_data(&ctx->firmware);
+	init_operational_data(&ctx->installing_software);
+	init_operational_data(&ctx->running_software);
+	default_download_policy(&ctx->firmware.policy);
+
+	error = load_startup_datastore(ctx);
+	if (error != SR_ERR_OK) {
+		SRP_LOG_ERR("load_startup_datastore error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("subscribing to module change");
+
+	error = sr_module_change_subscribe(session, BASE_YANG_MODEL, SOFTWARE_YANG_PATH,
+					   firmware_module_change_cb, *private_data, 0, SR_SUBSCR_DEFAULT, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_module_change_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("subscribing to get oper items");
+
+	error = sr_oper_get_items_subscribe(session, BASE_YANG_MODEL, SOFTWARE_YANG_STATE_PATH,
+					    firmware_state_software_cb, *private_data, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_oper_get_items_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	error = sr_oper_get_items_subscribe(session, BASE_YANG_MODEL, RUNNING_YANG_STATE_PATH,
+					    firmware_state_running_cb, *private_data, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_oper_get_items_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	error = sr_oper_get_items_subscribe(session, BASE_YANG_MODEL, VERSION_YANG_STATE_PATH,
+					    firmware_state_data_cb, *private_data, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_oper_get_items_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("subscribing to rpc");
+
+	error = sr_rpc_subscribe(session, RESTART_YANG_PATH,
+				 firmware_rpc_cb, *private_data, 0, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_rpc_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	error = sr_rpc_subscribe(session, RESET_YANG_PATH,
+				 firmware_rpc_cb, *private_data, 0, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_rpc_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+
+	SRP_LOG_INFMSG("plugin init done");
+
+	goto out;
+
+error_out:
+	sr_unsubscribe(subscription);
+
+out:
+
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
 }
 
-void sig_handler(int signum) {
-  INF_MSG("kill chdild process");
-  kill(sysupgrade_pid, SIGKILL);
+void firmware_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data)
+{
+	srpo_uci_cleanup();
+
+	plugin_ctx_t *ctx = (plugin_ctx_t *) private_data;
+
+	if (ctx->startup_session) {
+		sr_session_stop(ctx->startup_session);
+	}
+
+	clean_configuration_data(&ctx->firmware);
+	clean_operational_data(&ctx->installing_software);
+	clean_operational_data(&ctx->running_software);
+
+	if (can_restart(ctx) && sysupgrade_pid > 0) {
+		kill(sysupgrade_pid, SIGKILL);
+		sysupgrade_pid = 0;
+	}
+
+	FREE_SAFE(ctx);
+
+	SRP_LOG_INFMSG("plugin cleanup finished");
 }
 
-int load_startup_datastore(ctx_t *ctx) {
-  sr_conn_ctx_t *connection = NULL;
-  sr_session_ctx_t *session = NULL;
-  sr_val_t *values = NULL;
-  size_t count = 0;
-  int rc = SR_ERR_OK;
+static int firmware_module_change_cb(sr_session_ctx_t *session, const char *module_name,
+				     const char *xpath, sr_event_t event,
+				     uint32_t request_id, void *private_data)
+{
+	int error = 0;
+	plugin_ctx_t *ctx = (plugin_ctx_t *) private_data;
+	sr_change_iter_t *firmware_change_iter = NULL;
+	sr_change_oper_t operation = SR_OP_CREATED;
+	const struct lyd_node *node = NULL;
+	const char *prev_value = NULL;
+	const char *prev_list = NULL;
+	bool prev_default = false;
+	char *node_xpath = NULL;
+	bool software_changed = false;
+	bool software_deleted = false;
 
-  /* connect to sysrepo */
-  rc = sr_connect(SR_CONN_DEFAULT, &connection);
-  CHECK_RET(rc, cleanup, "Error by sr_connect: %s", sr_strerror(rc));
+	SRP_LOG_INF("module_name: %s, xpath: %s, event: %d, request_id: %" PRIu32, module_name, xpath, event, request_id);
 
-  /* start session */
-  rc = sr_session_start(connection, SR_DS_STARTUP, &session);
-  CHECK_RET(rc, cleanup, "Error by sr_session_start: %s", sr_strerror(rc));
+	if (event == SR_EV_ABORT) {
+		SRP_LOG_ERR("aborting changes for: %s", xpath);
+		error = -1;
+		goto out;
+	}
 
-  ctx->startup_sess = session;
-  ctx->startup_conn = connection;
+	if (event == SR_EV_DONE) {
+		error = sr_copy_config(ctx->startup_session, BASE_YANG_MODEL, SR_DS_RUNNING, 0, 0);
+		if (error) {
+			SRP_LOG_ERR("sr_copy_config error (%d): %s", error, sr_strerror(error));
+			goto out;
+		}
+	}
 
-  if (!can_restart(ctx)) {
-    INF_MSG("could not run a new sysupgrade process");
-    return rc;
-  }
+	if (event == SR_EV_CHANGE) {
+		error = sr_get_changes_iter(session, xpath, &firmware_change_iter);
+		if (error) {
+			SRP_LOG_ERR("sr_get_changes_iter error (%d): %s", error, sr_strerror(error));
+			goto out;
+		}
 
-  // load the startup firmware data into plugin
-  char *xpath = "/ietf-system:system/" YANG ":software/software//*";
+		while (sr_get_change_tree_next(session, firmware_change_iter, &operation, &node,
+					       &prev_value, &prev_list, &prev_default) == SR_ERR_OK) {
+			node_xpath = lyd_path(node);
 
-  rc = sr_get_items(ctx->startup_sess, xpath, 0, 0, &values, &count);
-  if (SR_ERR_NOT_FOUND == rc) {
-    INF_MSG("empty startup datastore for firmware data");
-    return SR_ERR_OK;
-  } else if (SR_ERR_OK != rc) {
-    goto cleanup;
-  }
+			if ((operation == SR_OP_MODIFIED || operation == SR_OP_CREATED) &&
+			    strncmp(node_xpath, SOFTWARE_XPATH, strlen(SOFTWARE_XPATH)) == 0) {
+				error = update_firmware_context_value(ctx, node);
+				if (error != SR_ERR_OK) {
+					SRP_LOG_ERR("update_firmware_context_value error (%d): %s", error, sr_strerror(error));
+					goto out;
+				}
 
-  size_t i;
-  for (i = 0; i < count; i++) {
-    if (0 == strncmp(values[i].xpath, xpath_system_software,
-                     strlen(xpath_system_software))) {
-      rc = update_firmware(ctx, &values[i]);
-      CHECK_RET(rc, cleanup, "failed to update firmware: %s", sr_strerror(rc));
-    } else if (0 == strncmp(values[i].xpath, xpath_download_policy,
-                            strlen(xpath_download_policy))) {
-      rc = update_firmware(ctx, &values[i]);
-      CHECK_RET(rc, cleanup, "failed to update firmware: %s", sr_strerror(rc));
-    }
-    sr_print_val(&values[i]);
-  }
-  if (NULL != values && 0 < count) {
-    sr_free_values(values, count);
-  }
+				software_changed = true;
 
-  if (true == compare_checksum(ctx, &ctx->firmware)) {
-    INF_MSG("the firmware has the same checksum as the installed one");
-    INF_MSG("don't perform sysupgrade");
-    return rc;
-  }
+			} else if ((operation == SR_OP_MODIFIED || operation == SR_OP_CREATED) &&
+				   strncmp(node_xpath, SOFTWARE_XPATH, strlen(SOFTWARE_XPATH)) == 0) {
+				software_deleted = true;
 
-  (void)signal(SIGUSR1, sig_handler);
-  sysupgrade_pid = fork();
-  INF("sysupgrade_pid %d", sysupgrade_pid);
-  if (-1 == sysupgrade_pid) {
-    ERR_MSG("failed to fork()");
-    rc = SR_ERR_INTERNAL;
-    goto cleanup;
-  } else if (0 == sysupgrade_pid) {
-    int rc = SR_ERR_OK;
-    while (true) {
-      rc = install_firmware(ctx);
-      if (SR_ERR_OK == rc) {
-        INF_MSG("firmware successfully installed");
-        break;
-      } else {
-        INF_MSG("failed to install firmware");
-        exit(EXIT_FAILURE);
-      }
-    }
-    INF_MSG("exit child process");
-    exit(EXIT_SUCCESS);
-  }
+			} else if ((operation == SR_OP_MODIFIED || operation == SR_OP_CREATED) &&
+				   strncmp(node_xpath, DOWNLOAD_POLICY_XPATH, strlen(DOWNLOAD_POLICY_XPATH)) == 0) {
+				error = update_firmware_context_value(ctx, node);
+				if (error != SR_ERR_OK) {
+					SRP_LOG_ERR("update_firmware_context_value error (%d): %s", error, sr_strerror(error));
+					goto out;
+				}
 
-  return rc;
+			} else if ((operation == SR_OP_DELETED) && strstr(node_xpath, "preserve-configuration") == 0) {
+				ctx->firmware.preserve_configuration = true;
+
+				software_changed = true;
+			}
+		}
+
+		if (compare_firmware_checksum(ctx, &ctx->firmware) == true) {
+			SRP_LOG_ERRMSG("update_firmware_context_value error: installed firmware has the same checksum");
+			goto out;
+		}
+
+		// create fork if it doesn't exist, if yes close it and create a new one
+		if ((software_changed || software_deleted) && sysupgrade_pid > 0) {
+			if (can_restart(ctx)) {
+				kill(sysupgrade_pid, SIGKILL);
+				sysupgrade_pid = 0;
+			} else {
+				/* don't accept the changes */
+				error = SR_ERR_INTERNAL;
+				goto out;
+			}
+		}
+
+		if (software_changed) {
+			signal(SIGUSR1, sigusr1_handler);
+
+			sysupgrade_pid = fork();
+			if (sysupgrade_pid < 0) {
+				SRP_LOG_ERRMSG("firmware_module_change_cb: unable to fork");
+				error = SR_ERR_INTERNAL;
+				goto out;
+			}
+
+			if (sysupgrade_pid == 0) {
+				/* continuously attempt to install firmware */
+				while (true) {
+					error = run_firmware_install_steps(ctx);
+					if (error == SR_ERR_OK) {
+						SRP_LOG_INFMSG("firmware_module_change_cb: update successful");
+						break;
+					} else {
+						SRP_LOG_ERRMSG("firmware_module_change_cb error: unable to install firmware");
+						exit(EXIT_FAILURE);
+					}
+				}
+
+				SRP_LOG_INFMSG("firmware_module_change_cb: update process exit");
+				exit(EXIT_SUCCESS);
+			}
+		}
+	}
+
+out:
+	sr_free_change_iter(firmware_change_iter);
+
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
+}
+
+static int firmware_state_data_cb(sr_session_ctx_t *session, const char *module_name,
+				  const char *path, const char *request_xpath, uint32_t request_id,
+				  struct lyd_node **parent, void *private_data)
+{
+	int error = SRPO_UBUS_ERR_OK;
+	srpo_ubus_result_values_t *values = NULL;
+	srpo_ubus_call_data_t ubus_call_data = {
+		.lookup_path = NULL, .method = NULL, .transform_data_cb = NULL,
+		.timeout = 0, .json_call_arguments = NULL
+	};
+
+	ubus_call_data.lookup_path = "router.system";
+	ubus_call_data.method = "info";
+
+	if (strcmp(path, VERSION_YANG_STATE_PATH) == 0) {
+		ubus_call_data.transform_data_cb = firmware_ubus_version;
+	} else {
+		SRP_LOG_ERR("firmware_state_data_cb: invalid path %s", path);
+		goto out;
+	}
+
+	srpo_ubus_init_result_values(&values);
+
+	error = srpo_ubus_call(values, &ubus_call_data);
+	if (error != SRPO_UBUS_ERR_OK) {
+		SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
+		goto out;
+	}
+
+	error = store_ubus_values_to_datastore(session, request_xpath, values, parent);
+	// TODO fix error handling here
+	if (error) {
+		SRP_LOG_ERR("store_ubus_values_to_datastore error (%d)", error);
+		goto out;
+	}
+
+out:
+	if (values) {
+		srpo_ubus_free_result_values(values);
+	}
+
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
+}
+
+static int firmware_state_software_cb(sr_session_ctx_t *session, const char *module_name,
+				      const char *path, const char *request_xpath, uint32_t request_id,
+				      struct lyd_node **parent, void *private_data)
+{
+	int error = SR_ERR_OK;
+	plugin_ctx_t *ctx = (plugin_ctx_t *) private_data;
+	char *xpath_list = NULL;
+	char *xpath = NULL;
+
+	size_t inst_size = ctx->installing_software.uri ? strlen(ctx->installing_software.uri) : 0;
+	size_t runn_size = ctx->running_software.uri ? strlen(ctx->running_software.uri) : 0;
+	size_t uri_size = inst_size > runn_size ? inst_size : runn_size;
+	size_t xpath_len = uri_size + 100;
+
+	xpath_list = (char *)xmalloc(sizeof(char) * xpath_len);
+	xpath = (char *)xmalloc(sizeof(char) * xpath_len);
+
+	if (ctx->installing_software.uri != NULL) {
+		snprintf(xpath_list, xpath_len, "%s[source='%s']", SOFTWARE_XPATH, ctx->installing_software.uri);
+
+		if (ctx->installing_software.version) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "version");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->installing_software.version, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+
+		if (ctx->installing_software.status && strlen(ctx->installing_software.status) > 0) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "status");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->installing_software.status, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+
+		if (ctx->installing_software.message && strlen(ctx->installing_software.message) > 0) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "message");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->installing_software.message, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+	}
+
+	if (ctx->running_software.uri != NULL) {
+		snprintf(xpath_list, xpath_len, "%s[source='%s']", SOFTWARE_XPATH, ctx->running_software.uri);
+
+		if (ctx->running_software.version) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "version");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->running_software.version, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+
+		if (ctx->running_software.status && strlen(ctx->running_software.status) > 0) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "status");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->running_software.status, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+
+		if (ctx->running_software.message && strlen(ctx->running_software.message) > 0) {
+			snprintf(xpath, xpath_len, "%s/%s", xpath_list, "message");
+
+			error = sr_set_item_str(session, xpath, (char *)ctx->running_software.message, NULL, SR_EDIT_DEFAULT);
+			if (error) {
+				SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+				goto cleanup;
+			}
+		}
+	}
+
+	error = sr_apply_changes(session, 0, 0);
+	if (error) {
+		SRP_LOG_ERR("sr_apply_changes error (%d): %s", error, sr_strerror(error));
+		goto cleanup;
+	}
+
 cleanup:
-  if (NULL != values && 0 < count) {
-    sr_free_values(values, count);
-  }
-  if (NULL != session) {
-    sr_session_stop(session);
-  }
-  if (NULL != connection) {
-    sr_disconnect(connection);
-  }
+	FREE_SAFE(xpath);
+	FREE_SAFE(xpath_list);
 
-  return rc;
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
 }
 
-static int update_firmware(ctx_t *ctx, sr_val_t *value) {
-  int rc = SR_ERR_OK;
-  sr_xpath_ctx_t state = {0, 0, 0, 0};
-  char *node = sr_xpath_last_node(value->xpath, &state);
+static int firmware_state_running_cb(sr_session_ctx_t *session, const char *module_name,
+				     const char *path, const char *request_xpath, uint32_t request_id,
+				     struct lyd_node **parent, void *private_data)
+{
+	int error = SR_ERR_OK;
+	plugin_ctx_t *ctx = (plugin_ctx_t *) private_data;
 
-  if (0 == strncmp(node, "source", strlen(node)) &&
-      SR_STRING_T == value->type) {
-    SET_STR(ctx->firmware.source.uri, value->data.string_val);
-    SET_STR(ctx->installing_software.uri, ctx->firmware.source.uri);
-  } else if (0 == strncmp(node, "password", strlen(node)) &&
-             SR_STRING_T == value->type) {
-    ctx->firmware.credentials.type = CRED_PASSWD;
-    SET_STR(ctx->firmware.credentials.val, value->data.string_val);
-  } else if (0 == strncmp(node, "certificate", strlen(node)) &&
-             SR_STRING_T == value->type) {
-    ctx->firmware.credentials.type = CRED_CERT;
-    SET_STR(ctx->firmware.credentials.val, value->data.string_val);
-  } else if (0 == strncmp(node, "ssh-key", strlen(node)) &&
-             SR_STRING_T == value->type) {
-    ctx->firmware.credentials.type = CRED_SSH_KEY;
-    SET_STR(ctx->firmware.credentials.val, value->data.string_val);
-  } else if (0 == strncmp(node, "preserve-configuration", strlen(node)) &&
-             SR_BOOL_T == value->type) {
-    ctx->firmware.preserve_configuration = value->data.bool_val;
-  } else if (0 == strncmp(node, "type", strlen(node)) &&
-             SR_ENUM_T == value->type) {
-    const char *type = value->data.string_val;
-    if (0 == strcmp("md5", type)) {
-      ctx->firmware.cksum.type = CKSUM_MD5;
-    } else if (0 == strcmp("sha-1", type)) {
-      ctx->firmware.cksum.type = CKSUM_SHA1;
-    } else if (0 == strcmp("sha-2", type)) {
-      ctx->firmware.cksum.type = CKSUM_SHA2;
-    } else if (0 == strcmp("sha-3", type)) {
-      ctx->firmware.cksum.type = CKSUM_SHA3;
-    } else if (0 == strcmp("sha-256", type)) {
-      ctx->firmware.cksum.type = CKSUM_SHA256;
-    } else {
-      rc = SR_ERR_VALIDATION_FAILED;
-      goto cleanup;
-    }
-  } else if (0 == strncmp(node, "value", strlen(node)) &&
-             SR_STRING_T == value->type) {
-    SET_STR(ctx->firmware.cksum.val, value->data.string_val);
-  } else if (0 == strncmp(node, "download-attempts", strlen(node)) &&
-             SR_UINT32_T == value->type) {
-    ctx->firmware.policy.download_attempts = value->data.uint32_val;
-  } else if (0 == strncmp(node, "retry-interval", strlen(node)) &&
-             SR_UINT32_T == value->type) {
-    ctx->firmware.policy.retry_interval = value->data.uint32_val;
-  } else if (0 == strncmp(node, "retry-randomness", strlen(node)) &&
-             SR_UINT32_T == value->type) {
-    ctx->firmware.policy.retry_randomness = value->data.uint32_val;
-  }
+	if (ctx->running_software.uri == NULL || ctx->running_software.status == NULL ||
+	    strcmp(ctx->running_software.status, "installed") != 0) {
+		goto cleanup;
+	}
+
+	error = sr_set_item_str(session, RUNNING_XPATH, (char *)ctx->running_software.uri, NULL, SR_EDIT_DEFAULT);
+	if (error) {
+		SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+		goto cleanup;
+	}
+
+	error = sr_apply_changes(session, 0, 0);
+	if (error) {
+		SRP_LOG_ERR("sr_apply_changes error (%d): %s", error, sr_strerror(error));
+		goto cleanup;
+	}
 
 cleanup:
-  sr_xpath_recover(&state);
-  return rc;
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
 }
 
-static int install_firmware(ctx_t *ctx) {
-  int rc = SR_ERR_OK;
+static int firmware_rpc_cb(sr_session_ctx_t *session, const char *op_path,
+			   const sr_val_t *input, const size_t input_cnt,
+			   sr_event_t event, uint32_t request_id,
+			   sr_val_t **output, size_t *output_cnt,
+			   void *private_data)
+{
+	int error = 0;
+	srpo_ubus_call_data_t ubus_call_data = {
+		.lookup_path = NULL, .method = NULL, .transform_data_cb = NULL,
+		.timeout = 0, .json_call_arguments = NULL
+	};
 
-  // download the firmware
-  INF_MSG("dl-planned");
-  SET_MEM_STR(ctx->installing_software.status, "dl-planned");
-  rc = firmware_download(ctx);
-  CHECK_RET(rc, cleanup, "failed to download firmware: %s", sr_strerror(rc));
-  INF_MSG("dl-done");
-  SET_MEM_STR(ctx->installing_software.status, "dlownload-done");
+	if (strcmp(op_path, RESET_YANG_PATH) == 0) {
+		SRP_LOG_ERRMSG("firmware_rpc_cb: unsupported action");
+		return SR_ERR_UNSUPPORTED;
+	}
 
-  INF_MSG("upgrade-in-progress");
-  SET_MEM_STR(ctx->installing_software.status, "upgrade-in-progress");
-  // run sysupgrade
-  rc = sysupgrade(ctx);
-  CHECK_RET(rc, cleanup, "failed to sysupgrade: %s", sr_strerror(rc));
+	signal(SIGUSR1, sigusr1_handler);
 
-  if (SR_ERR_INTERNAL == rc) {
-    char *filename = "/var/sysupgrade.lock";
-    if (access(filename, F_OK) != -1) {
-      remove(filename);
-    }
-  }
+	restart_pid = fork();
+	if (restart_pid < 0) {
+		SRP_LOG_ERRMSG("firmware_rpc_cb: unable to fork");
+		return SR_ERR_CALLBACK_FAILED;
+	}
 
-cleanup:
-  return rc;
-}
+	if (restart_pid == 0) {
+		sleep(3);
 
-static void default_download_policy(struct download_policy *policy) {
-  policy->download_attempts = 0;
-  policy->retry_interval = 600;
-  policy->retry_randomness = 300;
+		ubus_call_data.lookup_path = "system";
+
+		if (strcmp(op_path, RESTART_YANG_PATH) == 0) {
+			ubus_call_data.method = "reboot";
+		} else {
+			SRP_LOG_ERR("firmware_rpc_cb: invalid path %s", op_path);
+			exit(EXIT_FAILURE);
+		}
+
+		error = srpo_ubus_call(NULL, &ubus_call_data);
+		if (error != SRPO_UBUS_ERR_OK) {
+			SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
+			exit(EXIT_FAILURE);
+		}
+
+		exit(EXIT_SUCCESS);
+	} else {
+		SRP_LOG_DBG("firmware_rpc_cb: child in %d", restart_pid);
+	}
+
+	return SR_ERR_OK;
 }
 
 static void clean_configuration_data(firmware_t *firmware) {
-  SET_STR(firmware->credentials.val, NULL);
-  SET_STR(firmware->cksum.val, NULL);
-  SET_STR(firmware->source.uri, NULL);
+	SET_STR(firmware->credentials.value, NULL);
+	SET_STR(firmware->checksum.value, NULL);
+	SET_STR(firmware->source.uri, NULL);
 }
 
-static void init_operational_data(struct software_oper *oper) {
-  SET_STR(oper->version, NULL);
-  SET_STR(oper->uri, NULL);
-  oper->status =
-      mmap(NULL, 12, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, 0, 0);
-  oper->message =
-      mmap(NULL, 120, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, 0, 0);
+static void init_operational_data(oper_t *operational) {
+	SET_STR(operational->version, NULL);
+	SET_STR(operational->uri, NULL);
+
+	operational->status = mmap(NULL, 12, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, 0, 0);
+	operational->message = mmap(NULL, 120, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, 0, 0);
 }
 
-static void clean_operational_data(struct software_oper *oper) {
-  SET_STR(oper->version, NULL);
-  SET_STR(oper->uri, NULL);
+static void clean_operational_data(oper_t *operational) {
+	SET_STR(operational->version, NULL);
+	SET_STR(operational->uri, NULL);
 }
 
-static int parse_change(sr_session_ctx_t *session, const char *xpath,
-                        ctx_t *ctx, sr_event_t event) {
-  int rc = SR_ERR_OK;
-  sr_change_oper_t oper;
-  sr_change_iter_t *it = NULL;
-  sr_val_t *old_value = NULL;
-  sr_val_t *new_value = NULL;
-  char change_path[XPATH_MAX_LEN] = {
-      0,
-  };
-
-  snprintf(change_path, XPATH_MAX_LEN, "%s//*", xpath);
-
-  rc = sr_get_changes_iter(session, xpath, &it);
-  if (SR_ERR_OK != rc) {
-    printf("Get changes iter failed for xpath %s", xpath);
-    goto error;
-  }
-
-  bool software_changed = false;
-  bool software_deleted = false;
-  while (SR_ERR_OK ==
-         sr_get_change_next(session, it, &oper, &old_value, &new_value)) {
-    if ((SR_OP_MODIFIED == oper || SR_OP_CREATED == oper) && new_value &&
-        0 == strncmp(new_value->xpath, xpath_system_software,
-                     strlen(xpath_system_software))) {
-      INF_MSG("configuration has changed");
-      rc = update_firmware(ctx, new_value);
-      CHECK_RET(rc, error, "failed to update firmware: %s", sr_strerror(rc));
-      software_changed = true;
-    } else if ((SR_OP_MODIFIED == oper || SR_OP_CREATED == oper) && old_value &&
-               0 == strncmp(old_value->xpath, xpath_system_software,
-                            strlen(xpath_system_software))) {
-      software_deleted = true;
-    } else if ((SR_OP_MODIFIED == oper || SR_OP_CREATED == oper) && new_value &&
-               0 == strncmp(new_value->xpath, xpath_download_policy,
-                            strlen(xpath_download_policy))) {
-      rc = update_firmware(ctx, new_value);
-    } else if ((SR_OP_DELETED == oper) && old_value &&
-               0 == strstr(old_value->xpath, "preserve-configuration")) {
-      ctx->firmware.preserve_configuration = true;
-      software_changed = true;
-    }
-    sr_free_val(old_value);
-    sr_free_val(new_value);
-  }
-
-  if (true == compare_checksum(ctx, &ctx->firmware)) {
-    INF_MSG("the firmware has the same checksum as the installed one");
-    INF_MSG("don't perform sysupgrade");
-    goto error;
-  }
-
-  // creat fork if it doesn't exist, if yes close it and create a new one
-  if (software_changed || software_deleted) {
-    if (0 < sysupgrade_pid) {
-      if (can_restart(ctx)) {
-        INF_MSG("kill old sysupgrade process");
-        kill(sysupgrade_pid, SIGKILL);
-        sysupgrade_pid = 0;
-      } else {
-        /* don't accept the changes */
-        rc = SR_ERR_INTERNAL;
-        goto error;
-      }
-    }
-  }
-
-  if (software_changed) {
-    (void)signal(SIGUSR1, sig_handler);
-    sysupgrade_pid = fork();
-    INF("sysupgrade_pid %d", sysupgrade_pid);
-    if (-1 == sysupgrade_pid) {
-      ERR_MSG("failed to fork()");
-      rc = SR_ERR_INTERNAL;
-      goto error;
-    } else if (0 == sysupgrade_pid) {
-      int rc = SR_ERR_OK;
-      while (true) {
-        rc = install_firmware(ctx);
-        if (SR_ERR_OK == rc) {
-          INF_MSG("firmware successfully installed");
-          break;
-        } else {
-          INF_MSG("failed to install firmware");
-          exit(EXIT_FAILURE);
-        }
-      }
-      INF_MSG("exit child process");
-      exit(EXIT_SUCCESS);
-    }
-  }
-
-  INF_MSG("exit change_cb");
-error:
-  if (NULL != it) {
-    sr_free_change_iter(it);
-  }
-  return rc;
+static void default_download_policy(struct download_policy *policy) {
+	policy->download_attempts = 0;
+	policy->retry_interval = 600;
+	policy->retry_randomness = 300;
 }
 
-static int change_cb(sr_session_ctx_t *session, const char *module_name,
-                     const char *xpath, sr_event_t event, uint32_t request_id,
-                     void *private_data) {
-  int rc = SR_ERR_OK;
-  ctx_t *ctx = private_data;
-  INF("%s configuration has changed.", YANG);
+static int update_firmware_context_value(plugin_ctx_t *ctx, const struct lyd_node *node)
+{
+	int error = SR_ERR_OK;
+	struct lyd_node_leaf_list *node_list = NULL;
+	const char *node_name = NULL;
+	const char *node_value = NULL;
 
-  ctx->sess = session;
+	node_name = node->schema->name;
+	if (node->schema->nodetype != LYS_LEAF && node->schema->nodetype != LYS_LEAFLIST)
+		return SR_ERR_OK;
 
-  /* copy ietf-sytem running to startup */
-  if (SR_EV_DONE == event) {
-    /* copy running datastore to startup */
+	node_list = (struct lyd_node_leaf_list *) node;
 
-    rc = sr_copy_config(ctx->startup_sess, "ietf-system", SR_DS_RUNNING,
-                        SR_DS_STARTUP, 0);
-    if (SR_ERR_OK != rc) {
-      WRN_MSG("Failed to copy running datastore to startup");
-      /* TODO handle this error */
-      return rc;
-    }
-    return SR_ERR_OK;
-  }
+	if (strncmp(node_name, "source", strlen(node_name)) == 0 &&
+	    node_list->value_type == LY_TYPE_STRING) {
+		SET_STR(ctx->firmware.source.uri, node_list->value_str);
+		SET_STR(ctx->installing_software.uri, ctx->firmware.source.uri);
 
-  rc = parse_change(session, xpath, ctx, event);
-  CHECK_RET(rc, error, "failed to apply sysrepo: %s", sr_strerror(rc));
+	} else if (strncmp(node_name, "password", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_STRING) {
+		ctx->firmware.credentials.type = CRED_PASSWD;
+		SET_STR(ctx->firmware.credentials.value, node_list->value_str);
 
-error:
-  return rc;
-}
+	} else if (strncmp(node_name, "certificate", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_STRING) {
+		ctx->firmware.credentials.type = CRED_CERT;
+		SET_STR(ctx->firmware.credentials.value, node_list->value_str);
 
-static int running_software_cb(sr_session_ctx_t *session,
-                               const char *module_name, const char *path,
-                               const char *request_xpath, uint32_t request_id,
-                               struct lyd_node **parent, void *private_data) {
-  int rc = SR_ERR_OK;
-  ctx_t *ctx = private_data;
-  sr_val_t *values = NULL;
-  size_t values_cnt = 0;
-  char *xpath = "/ietf-system:system-state/" YANG ":running-software";
-  char *value_string = NULL;
-  const struct ly_ctx *ly_ctx = NULL;
+	} else if (strncmp(node_name, "ssh-key", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_STRING) {
+		ctx->firmware.credentials.type = CRED_SSH_KEY;
+		SET_STR(ctx->firmware.credentials.value, node_list->value_str);
 
-  if (NULL == ctx->running_software.uri) {
-    return rc;
-  }
-  if (NULL == ctx->running_software.status) {
-    return rc;
-  }
-  if (0 != strcmp(ctx->running_software.status, "installed")) {
-    return rc;
-  }
+	} else if (strncmp(node_name, "preserve-configuration", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_BOOL) {
+		ctx->firmware.preserve_configuration =
+			(strcmp(node_list->value_str, "true") == 0) ? true : false;
 
-  values_cnt = 1;
-  rc = sr_new_values(values_cnt, &values);
-  CHECK_RET(rc, error, "failed sr_new_values: %s", sr_strerror(rc));
+	} else if (strncmp(node_name, "type", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_ENUM) {
+		node_value = node_list->value_str;
 
-  sr_val_set_xpath(&values[0], xpath);
-  sr_val_set_str_data(&values[0], SR_STRING_T,
-                      (char *)ctx->running_software.uri);
+		if (strcmp("md5", node_value) == 0) {
+			ctx->firmware.checksum.type = CKSUM_MD5;
 
-  sr_print_val(&values[0]);
+		} else if (strcmp("sha-1", node_value) == 0) {
+			ctx->firmware.checksum.type = CKSUM_SHA1;
 
-  if (*parent == NULL) {
-    ly_ctx = sr_get_context(sr_session_get_connection(session));
-    CHECK_NULL_MSG(ly_ctx, &rc, error,
-                   "sr_get_context error: libyang context is NULL");
-    *parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
-  }
+		} else if (strcmp("sha-2", node_value) == 0) {
+			ctx->firmware.checksum.type = CKSUM_SHA2;
 
-  for (size_t i = 0; i < values_cnt; i++) {
-    value_string = sr_val_to_str(&values[i]);
-    lyd_new_path(*parent, NULL, values[i].xpath, value_string, 0, 0);
-    free(value_string);
-    value_string = NULL;
-  }
+		} else if (strcmp("sha-3", node_value) == 0) {
+			ctx->firmware.checksum.type = CKSUM_SHA3;
 
-error:
-  if (values != NULL) {
-    sr_free_values(values, values_cnt);
-    values = NULL;
-    values_cnt = 0;
-  }
-  return rc;
-}
+		} else if (strcmp("sha-256", node_value) == 0) {
+			ctx->firmware.checksum.type = CKSUM_SHA256;
 
-static int state_data_cb(sr_session_ctx_t *session, const char *module_name,
-                         const char *path, const char *request_xpath,
-                         uint32_t request_id, struct lyd_node **parent,
-                         void *private_data) {
-  int rc = SR_ERR_OK;
-  ctx_t *ctx = private_data;
-  int counter = 0;
-  sr_val_t *values = NULL;
-  size_t values_cnt = 0;
-  char *xpath_base = "/ietf-system:system-state/" YANG ":software";
-  char *xpath_list = NULL;
-  char *xpath = NULL;
-  char *value_string = NULL;
-  const struct ly_ctx *ly_ctx = NULL;
+		} else {
+			error = SR_ERR_VALIDATION_FAILED;
+			goto cleanup;
+		}
+	} else if (strncmp(node_name, "value", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_STRING) {
+		SET_STR(ctx->firmware.checksum.value, node_list->value_str);
 
-  /* currently running software */
-  if (NULL != ctx->running_software.uri) {
-    if (NULL != ctx->running_software.version)
-      counter++;
-    if (NULL != ctx->running_software.message &&
-        0 < strlen(ctx->running_software.message))
-      counter++;
-    if (NULL != ctx->running_software.status &&
-        0 < strlen(ctx->running_software.status))
-      counter++;
-  }
+	} else if (strncmp(node_name, "download-attempts", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_UINT32) {
+		ctx->firmware.policy.download_attempts = node_list->value.uint32;
 
-  /* installing software */
-  if (NULL != ctx->installing_software.uri) {
-    if (NULL != ctx->installing_software.version)
-      counter++;
-    if (NULL != ctx->installing_software.message &&
-        0 < strlen(ctx->installing_software.message))
-      counter++;
-    if (NULL != ctx->installing_software.status &&
-        0 < strlen(ctx->installing_software.status))
-      counter++;
-  }
+	} else if (strncmp(node_name, "retry-interval", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_UINT32) {
+		ctx->firmware.policy.retry_interval = node_list->value.uint32;
 
-  values_cnt = counter;
-  rc = sr_new_values(values_cnt, &values);
-  CHECK_RET(rc, error, "failed sr_new_values: %s", sr_strerror(rc));
-
-  counter = 0;
-
-  int inst_size =
-      ctx->installing_software.uri ? strlen(ctx->installing_software.uri) : 0;
-  int runn_size =
-      ctx->running_software.uri ? strlen(ctx->running_software.uri) : 0;
-  int uri_size = inst_size > runn_size ? inst_size : runn_size;
-  int xpath_len = uri_size + XPATH_MAX_LEN;
-  xpath_list = (char *)malloc(sizeof(char) * xpath_len);
-  xpath = (char *)malloc(sizeof(char) * xpath_len);
-
-  if (NULL != ctx->installing_software.uri) {
-    snprintf(xpath_list, xpath_len, "%s[source='%s']", xpath_base,
-             ctx->installing_software.uri);
-    if (ctx->installing_software.version) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "version");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_STRING_T,
-                          (char *)ctx->installing_software.version);
-      counter++;
-    }
-    if (ctx->installing_software.status &&
-        0 < strlen(ctx->installing_software.status)) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "status");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_ENUM_T,
-                          (char *)ctx->installing_software.status);
-      counter++;
-    }
-    if (ctx->installing_software.message &&
-        0 < strlen(ctx->installing_software.message)) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "message");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_STRING_T,
-                          (char *)ctx->installing_software.message);
-      counter++;
-    }
-  }
-
-  /* running software */
-  if (NULL != ctx->running_software.uri) {
-    snprintf(xpath_list, xpath_len, "%s[source='%s']", xpath_base,
-             ctx->running_software.uri);
-    if (ctx->running_software.version) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "version");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_STRING_T,
-                          (char *)ctx->running_software.version);
-      counter++;
-    }
-    if (ctx->running_software.status &&
-        0 < strlen(ctx->running_software.status)) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "status");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_ENUM_T,
-                          (char *)ctx->running_software.status);
-      counter++;
-    }
-    if (ctx->running_software.message &&
-        0 < strlen(ctx->running_software.message)) {
-      snprintf(xpath, xpath_len, "%s/%s", xpath_list, "message");
-      sr_val_set_xpath(&values[counter], xpath);
-      sr_val_set_str_data(&values[counter], SR_STRING_T,
-                          (char *)ctx->running_software.message);
-      counter++;
-    }
-  }
-
-  if (*parent == NULL) {
-    ly_ctx = sr_get_context(sr_session_get_connection(session));
-    CHECK_NULL_MSG(ly_ctx, &rc, error,
-                   "sr_get_context error: libyang context is NULL");
-    *parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
-  }
-
-  for (size_t i = 0; i < values_cnt; i++) {
-    value_string = sr_val_to_str(&values[i]);
-    lyd_new_path(*parent, NULL, values[i].xpath, value_string, 0, 0);
-    free(value_string);
-    value_string = NULL;
-  }
-
-error:
-  if (NULL != xpath) {
-    free(xpath);
-  }
-  if (NULL != xpath_list) {
-    free(xpath_list);
-  }
-  if (values != NULL) {
-    sr_free_values(values, values_cnt);
-    values = NULL;
-    values_cnt = 0;
-  }
-  return rc;
-}
-
-static void software_version_ubus_cb(struct ubus_request *req, int type,
-                                     struct blob_attr *msg) {
-  ubus_ctx_t *ubus_ctx = req->priv;
-  struct json_object *jobj_parent = NULL, *jobj_release = NULL,
-                     *jobj_description = NULL;
-  char *json_string = NULL;
-  const char *result_string = NULL;
-  int rc = SR_ERR_OK;
-
-  if (msg) {
-    json_string = blobmsg_format_json(msg, true);
-    jobj_parent = json_tokener_parse(json_string);
-  } else {
-    goto cleanup;
-  }
-
-  json_object_object_get_ex(jobj_parent, "release", &jobj_release);
-  if (NULL == jobj_release) {
-    goto cleanup;
-  }
-  json_object_object_get_ex(jobj_release, "description", &jobj_description);
-  if (NULL == jobj_description) {
-    goto cleanup;
-  }
-
-  result_string = json_object_get_string(jobj_description);
-
-  *ubus_ctx->values_cnt = 1;
-  rc = sr_new_val("/ietf-system:system-state/ietf-system:platform/" YANG
-                  ":software-version",
-                  ubus_ctx->values);
-  CHECK_RET(rc, cleanup, "failed sr_new_values: %s", sr_strerror(rc));
-  sr_val_set_str_data(*ubus_ctx->values, SR_STRING_T, result_string);
+	} else if (strncmp(node_name, "retry-randomness", strlen(node_name)) == 0 &&
+		   node_list->value_type == LY_TYPE_UINT32) {
+		ctx->firmware.policy.retry_randomness = node_list->value.uint32;
+	}
 
 cleanup:
-  if (NULL != jobj_parent) {
-    json_object_put(jobj_parent);
-  }
-  if (NULL != json_string) {
-    free(json_string);
-  }
-  return;
+
+	return error;
 }
 
-static int software_version_cb(sr_session_ctx_t *session,
-                               const char *module_name, const char *path,
-                               const char *request_xpath, uint32_t request_id,
-                               struct lyd_node **parent, void *private_data) {
-  int rc = SR_ERR_OK;
-  ctx_t *ctx = private_data;
-  uint32_t id = 0;
-  struct blob_buf buf = {0};
-  ubus_ctx_t ubus_ctx = {0, 0, 0};
-  int u_rc = UBUS_STATUS_OK;
-  sr_val_t *values = NULL;
-  size_t values_cnt = 0;
-  char *value_string = NULL;
-  const struct ly_ctx *ly_ctx = NULL;
+static void firmware_ubus_version(const char *ubus_json, srpo_ubus_result_values_t *values)
+{
+	json_object *result = NULL;
+	json_object *release = NULL;
+	json_object *description = NULL;
+	const char *string = NULL;
+	srpo_ubus_error_e error = SRPO_UBUS_ERR_OK;
 
-  struct ubus_context *u_ctx = ubus_connect(NULL);
-  if (u_ctx == NULL) {
-    ERR_MSG("Could not connect to ubus");
-    rc = SR_ERR_INTERNAL;
-    goto cleanup;
-  }
+	result = json_tokener_parse(ubus_json);
+	json_object_object_get_ex(result, "release", &release);
+	json_object_object_get_ex(release, "description", &description);
+	string = json_object_get_string(description);
 
-  blob_buf_init(&buf, 0);
-  u_rc = ubus_lookup_id(u_ctx, "system", &id);
-  if (UBUS_STATUS_OK != u_rc) {
-    ERR("ubus [%d]: no object system\n", u_rc);
-    rc = SR_ERR_INTERNAL;
-    goto cleanup;
-  }
-
-  ubus_ctx.ctx = ctx;
-  ubus_ctx.values = &values;
-  ubus_ctx.values_cnt = &values_cnt;
-  u_rc = ubus_invoke(u_ctx, id, "board", buf.head, software_version_ubus_cb,
-                     &ubus_ctx, 0);
-  if (UBUS_STATUS_OK != u_rc) {
-    ERR("ubus [%d]: no object info\n", u_rc);
-    rc = SR_ERR_INTERNAL;
-    goto cleanup;
-  }
-
-  if (*parent == NULL) {
-    ly_ctx = sr_get_context(sr_session_get_connection(session));
-    CHECK_NULL_MSG(ly_ctx, &rc, cleanup,
-                   "sr_get_context error: libyang context is NULL");
-    *parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
-  }
-
-  for (size_t i = 0; i < values_cnt; i++) {
-    value_string = sr_val_to_str(&values[i]);
-    lyd_new_path(*parent, NULL, values[i].xpath, value_string, 0, 0);
-    free(value_string);
-    value_string = NULL;
-  }
+	error = srpo_ubus_result_values_add(values, string, strlen(string),
+					    VERSION_YANG_STATE_PATH, strlen(VERSION_YANG_STATE_PATH),
+					    " ", strlen(" "));
+	if (error != SRPO_UBUS_ERR_OK) {
+		goto cleanup;
+	}
 
 cleanup:
-  if (NULL != u_ctx) {
-    ubus_free(u_ctx);
-    blob_buf_free(&buf);
-  }
+	json_object_put(result);
 
-  if (values != NULL) {
-    sr_free_values(values, values_cnt);
-    values = NULL;
-    values_cnt = 0;
-  }
-  return rc;
+	return;
 }
 
-static int rpc_firstboot_cb(sr_session_ctx_t *session, const char *op_path,
-                            const sr_val_t *input, const size_t input_cnt,
-                            sr_event_t event, uint32_t request_id,
-                            sr_val_t **output, size_t *output_cnt,
-                            void *private_data) {
-  INF_MSG("rpc callback rpc_firstboot_cb currently not supported");
+static int can_restart(plugin_ctx_t *ctx)
+{
+	if (access("/var/sysupgrade.lock", F_OK) != -1)
+		return false;
 
-  return SR_ERR_UNSUPPORTED;
+	if (strcmp(ctx->installing_software.status, "upgrade-in-progress") == 0)
+		return false;
+
+	if (strcmp(ctx->installing_software.status, "upgrade-done") == 0)
+		return false;
+
+	return true;
 }
 
-static int rpc_reboot_cb(sr_session_ctx_t *session, const char *op_path,
-                         const sr_val_t *input, const size_t input_cnt,
-                         sr_event_t event, uint32_t request_id,
-                         sr_val_t **output, size_t *output_cnt,
-                         void *private_data) {
-  (void)signal(SIGUSR1, sig_handler);
-  size_t rpcd_pid = fork();
+static int run_firmware_install_steps(plugin_ctx_t *ctx)
+{
+	int error = SR_ERR_OK;
+	char *sysupgrade_lock_file = "/var/sysupgrade.lock";
 
-  INF("rpcd_pid %d", rpcd_pid);
-  if (-1 == sysupgrade_pid) {
-    ERR_MSG("failed to fork()");
-    return SR_ERR_INTERNAL;
-  } else if (0 == rpcd_pid) {
-    /* wait for sysrepo/netopeer2 to finish the RPC call */
-    sleep(3);
+	SRP_LOG_INFMSG("install_firmware: starting download");
+	SET_MEM_STR(ctx->installing_software.status, "dl-planned");
 
-    INF_MSG("rpc callback rpc_reboot_cb has been called");
-    struct blob_buf buf = {0};
-    uint32_t id = 0;
-    int u_rc = 0;
+	error = download_firmware(ctx);
+	if (error != SR_ERR_OK) {
+		SRP_LOG_INFMSG("install_firmware error: failed to download firmware");
+		goto cleanup;
+	}
 
-    struct ubus_context *u_ctx = ubus_connect(NULL);
-    if (u_ctx == NULL) {
-      ERR_MSG("Could not connect to ubus");
-      goto cleanup;
-    }
+	SRP_LOG_INFMSG("install_firmware: download complete");
+	SET_MEM_STR(ctx->installing_software.status, "dlownload-done");
 
-    blob_buf_init(&buf, 0);
-    u_rc = ubus_lookup_id(u_ctx, "system", &id);
-    if (UBUS_STATUS_OK != u_rc) {
-      ERR("ubus [%d]: no object system", u_rc);
-      goto cleanup;
-    }
+	SRP_LOG_INFMSG("install_firmware: starting upgrade");
+	SET_MEM_STR(ctx->installing_software.status, "upgrade-in-progress");
 
-    u_rc = ubus_invoke(u_ctx, id, "reboot", buf.head, NULL, NULL, 0);
-    if (UBUS_STATUS_OK != u_rc) {
-      ERR("ubus [%d]: no object reboot", u_rc);
-      goto cleanup;
-    }
+	error = install_firmware(ctx);
+	if (error != SR_ERR_OK) {
+		SRP_LOG_INFMSG("install_firmware error: failed to install firmware");
+		goto cleanup;
+	}
 
-  cleanup:
-    if (NULL != u_ctx) {
-      ubus_free(u_ctx);
-      blob_buf_free(&buf);
-    }
+	if (error == SR_ERR_INTERNAL) {
+		if (access(sysupgrade_lock_file, F_OK) != -1) {
+			remove(sysupgrade_lock_file);
+		}
+	}
 
-    if (UBUS_STATUS_OK != u_rc) {
-      return SR_ERR_INTERNAL;
-    }
-    exit(EXIT_SUCCESS);
-  }
-  return SR_ERR_OK;
+cleanup:
+	return error;
 }
 
-int sr_plugin_init_cb(sr_session_ctx_t *session, void **private_ctx) {
-  int rc = SR_ERR_OK;
-  sysupgrade_pid = 0;
+static int load_startup_datastore(plugin_ctx_t *ctx)
+{
+	int error = SR_ERR_OK;
+	struct lyd_node *root = NULL;
+	struct lyd_node *child = NULL;
+	struct lyd_node *next = NULL;
+	struct lyd_node *node = NULL;
 
-  /* INF("sr_plugin_init_cb for sysrepo-plugin-dt-network"); */
+	if (!can_restart(ctx)) {
+		SRP_LOG_INFMSG("load_startup_datastore: cannot run new upgrade process");
+		return SR_ERR_OK;
+	}
 
-  ctx_t *ctx = calloc(1, sizeof(*ctx));
-  ctx->sub = NULL;
-  ctx->sess = session;
-  ctx->startup_conn = NULL;
-  ctx->startup_sess = NULL;
-  ctx->yang_model = YANG;
-  *private_ctx = ctx;
-  clean_configuration_data(&ctx->firmware);
-  init_operational_data(&ctx->installing_software);
-  init_operational_data(&ctx->running_software);
-  default_download_policy(&ctx->firmware.policy);
+	error = sr_get_data(ctx->startup_session, SOFTWARE_YANG_PATH "//*", 0, 0, SR_OPER_DEFAULT, &root);
+	if (error == SR_ERR_NOT_FOUND) {
+		SRP_LOG_INFMSG("load_startup_datastore: empty startup datastore");
+		return SR_ERR_OK;
+	} else if (error != SR_ERR_OK) {
+		goto cleanup;
+	}
 
-  /* load the startup datastore */
-  INF_MSG("load sysrepo startup datastore");
-  rc = load_startup_datastore(ctx);
-  CHECK_RET(rc, error, "failed to load startup datastore: %s", sr_strerror(rc));
+	LY_TREE_FOR(root->child, child) {
+		LY_TREE_DFS_BEGIN(child, next, node) {
+			update_firmware_context_value(ctx, node);
+		LY_TREE_DFS_END(child, next, node)};
+	}
 
-  rc = sr_module_change_subscribe(
-      ctx->sess, "ietf-system", "/ietf-system:system/" YANG ":software",
-      change_cb, *private_ctx, 0, SR_SUBSCR_DEFAULT, &ctx->sub);
-  CHECK_RET(rc, error, "initialization error: %s", sr_strerror(rc));
+cleanup:
+	lyd_free(node);
+	lyd_free(next);
+	lyd_free(child);
+	lyd_free(root);
 
-  rc = sr_oper_get_items_subscribe(
-      ctx->sess, "ietf-system",
-      "/ietf-system:system-state/ietf-system:platform/" YANG
-      ":software-version",
-      software_version_cb, ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);
-  CHECK_RET(rc, error, "failed sr_dp_get_items_subscribe: %s", sr_strerror(rc));
-
-  rc = sr_oper_get_items_subscribe(
-      ctx->sess, "ietf-system", "/ietf-system:system-state/" YANG ":software",
-      state_data_cb, ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);
-  CHECK_RET(rc, error, "failed sr_dp_get_items_subscribe: %s", sr_strerror(rc));
-
-  rc = sr_oper_get_items_subscribe(
-      ctx->sess, "ietf-system",
-      "/ietf-system:system-state/" YANG ":running-software",
-      running_software_cb, ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);
-  CHECK_RET(rc, error, "failed sr_dp_get_items_subscribe: %s", sr_strerror(rc));
-
-  rc = sr_rpc_subscribe(ctx->sess, "/" YANG ":system-reset-restart",
-                        rpc_firstboot_cb, ctx, 0, SR_SUBSCR_CTX_REUSE,
-                        &ctx->sub);
-  CHECK_RET(rc, error, "failed sr_rpc_subscribe: %s", sr_strerror(rc));
-
-  rc = sr_rpc_subscribe(ctx->sess, "/ietf-system:system-restart", rpc_reboot_cb,
-                        ctx, 0, SR_SUBSCR_CTX_REUSE, &ctx->sub);
-  CHECK_RET(rc, error, "failed sr_rpc_subscribe: %s", sr_strerror(rc));
-
-  return SR_ERR_OK;
-
-error:
-  ERR("Plugin initialization failed: %s", sr_strerror(rc));
-  if (NULL != ctx->sub) {
-    sr_unsubscribe(ctx->sub);
-    ctx->sub = NULL;
-  }
-  return rc;
+	return error;
 }
 
-void sr_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_ctx) {
-  INF("Plugin cleanup called, private_ctx is %s available.",
-      private_ctx ? "" : "not");
-  if (!private_ctx)
-    return;
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent)
+{
+	const struct ly_ctx *ly_ctx = NULL;
+	if (*parent == NULL) {
+		ly_ctx = sr_get_context(sr_session_get_connection(session));
+		if (ly_ctx == NULL) {
+			return -1;
+		}
+		*parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
+	}
 
-  ctx_t *ctx = private_ctx;
-  if (NULL == ctx) {
-    return;
-  }
-  /* clean startup datastore */
-  if (NULL != ctx->startup_sess) {
-    sr_session_stop(ctx->startup_sess);
-  }
-  if (NULL != ctx->startup_conn) {
-    sr_disconnect(ctx->startup_conn);
-  }
-  if (NULL != ctx->sub) {
-    sr_unsubscribe(ctx->sub);
-  }
-  clean_configuration_data(&ctx->firmware);
-  clean_operational_data(&ctx->installing_software);
-  clean_operational_data(&ctx->running_software);
+	for (size_t i = 0; i < values->num_values; i++) {
+		lyd_new_path(*parent, NULL, values->values[i].xpath, values->values[i].value, 0, 0);
+	}
 
-  if (can_restart(ctx) && sysupgrade_pid > 0) {
-    INF_MSG("kill background sysupgrade process");
-    INF("kill pid %d", sysupgrade_pid);
-    kill(sysupgrade_pid, SIGKILL);
-    sysupgrade_pid = 0;
-  }
-
-  free(ctx);
-
-  DBG_MSG("Plugin cleaned-up successfully");
+	return 0;
 }
+
+static void sigusr1_handler(__attribute__((unused)) int signum)
+{
+	SRP_LOG_INFMSG("SIGUSR1 called, killing children...");
+
+	kill(sysupgrade_pid, SIGKILL);
+	sysupgrade_pid = 0;
+
+	kill(restart_pid, SIGKILL);
+	restart_pid = 0;
+}
+
 
 #ifndef PLUGIN
 #include <signal.h>
-#include <unistd.h>
 
 volatile int exit_application = 0;
 
-static void sigint_handler(__attribute__((unused)) int signum) {
-  INF_MSG("Sigint called, exiting...");
-  exit_application = 1;
+static void sigint_handler(__attribute__((unused)) int signum);
+
+int main()
+{
+	int error = SR_ERR_OK;
+	sr_conn_ctx_t *connection = NULL;
+	sr_session_ctx_t *session = NULL;
+	void *private_data = NULL;
+
+	sr_log_stderr(SR_LL_DBG);
+
+	/* connect to sysrepo */
+	error = sr_connect(SR_CONN_DEFAULT, &connection);
+	if (error) {
+		SRP_LOG_ERR("sr_connect error (%d): %s", error, sr_strerror(error));
+		goto out;
+	}
+
+	error = sr_session_start(connection, SR_DS_RUNNING, &session);
+	if (error) {
+		SRP_LOG_ERR("sr_session_start error (%d): %s", error, sr_strerror(error));
+		goto out;
+	}
+
+	error = firmware_plugin_init_cb(session, &private_data);
+	if (error) {
+		SRP_LOG_ERRMSG("firmware_plugin_init_cb error");
+		goto out;
+	}
+
+	/* loop until ctrl-c is pressed / SIGINT is received */
+	signal(SIGINT, sigint_handler);
+	signal(SIGPIPE, SIG_IGN);
+	while (!exit_application) {
+		sleep(1);
+	}
+
+out:
+	firmware_plugin_cleanup_cb(session, private_data);
+	sr_disconnect(connection);
+
+	return error ? -1 : 0;
 }
 
-int main() {
-  INF_MSG("Plugin application mode initialized");
-  sr_conn_ctx_t *connection = NULL;
-  sr_session_ctx_t *session = NULL;
-  void *private_ctx = NULL;
-  int rc = SR_ERR_OK;
-
-  ENABLE_LOGGING(SR_LL_DBG);
-
-  /* connect to sysrepo */
-  rc = sr_connect(SR_CONN_DEFAULT, &connection);
-  CHECK_RET(rc, cleanup, "Error by sr_connect: %s", sr_strerror(rc));
-
-  /* start session */
-  rc = sr_session_start(connection, SR_DS_RUNNING, &session);
-  CHECK_RET(rc, cleanup, "Error by sr_session_start: %s", sr_strerror(rc));
-
-  rc = sr_plugin_init_cb(session, &private_ctx);
-  CHECK_RET(rc, cleanup, "Error by sr_plugin_init_cb: %s", sr_strerror(rc));
-
-  /* loop until ctrl-c is pressed / SIGINT is received */
-  signal(SIGINT, sigint_handler);
-  signal(SIGPIPE, SIG_IGN);
-  while (!exit_application) {
-    sleep(1); /* or do some more useful work... */
-  }
-
-cleanup:
-  sr_plugin_cleanup_cb(session, private_ctx);
-  if (NULL != session) {
-    sr_session_stop(session);
-  }
-  if (NULL != connection) {
-    sr_disconnect(connection);
-  }
+static void sigint_handler(__attribute__((unused)) int signum)
+{
+	SRP_LOG_INFMSG("Sigint called, exiting...");
+	exit_application = 1;
 }
+
 #endif
