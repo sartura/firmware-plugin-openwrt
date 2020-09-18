@@ -1,0 +1,3 @@
+<action xmlns="urn:ietf:params:xml:ns:yang:1">
+  <system-reset-restart xmlns="http://router.net/ns/yang/router-software"/>
+</action>
