@@ -21,7 +21,7 @@
 #define ARRAY_SIZE(X) (sizeof((X)) / sizeof((X)[0]))
 
 #define BASE_YANG_MODEL "ietf-system"
-#define SOFTWARE_YANG_MODEL "terastream-software"
+#define SOFTWARE_YANG_MODEL "router-software"
 
 #define RESTART_YANG_PATH "/" BASE_YANG_MODEL ":system-restart"
 #define SOFTWARE_YANG_PATH "/" BASE_YANG_MODEL ":system/" SOFTWARE_YANG_MODEL ":software"
